@@ -16,7 +16,7 @@ from telegram.ext import (
 # CONFIG
 # ==========================
 
-BOT_TOKEN = "PUT_YOUR_TOKEN_HERE"
+BOT_TOKEN = "8921983178:AAGtkbi1tLNo9qA9CHpD4KdsxLZw6ut3hkY"
 
 CHAT_ID = -1004273685959
 
