@@ -1,45 +1,31 @@
 import asyncio
-from datetime import datetime
+from mcstatus import BedrockServer
 
-from mcstatus import JavaServer
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+HOST = "darkhaldwani.aternos.me"
+PORT = 50742
+
+CHECK_INTERVAL = 60
+
+ONLINE_THRESHOLD = 2
+OFFLINE_THRESHOLD = 2
+
+SERVER = BedrockServer.lookup(
+    f"{HOST}:{PORT}"
 )
 
-# ==========================
-# CONFIG
-# ==========================
-
-BOT_TOKEN = "8921983178:AAGtkbi1tLNo9qA9CHpD4KdsxLZw6ut3hkY"
-CHAT_ID = -1004273685959  # Your Telegram chat ID
-SERVER_ADDRESS = "darkhaldwani.aternos.me"
-CHECK_INTERVAL = 30
-
-# ==========================
-# SERVER STATUS
-# ==========================
 
 async def get_server_status():
     try:
-        server = JavaServer.lookup(SERVER_ADDRESS)
-        status = await server.async_status()
-
-        players = []
-
-        if status.players.sample:
-            players = [p.name for p in status.players.sample]
+        status = await asyncio.wait_for(
+            SERVER.async_status(),
+            timeout=8
+        )
 
         return {
             "online": True,
-            "players_online": status.players.online,
-            "players_max": status.players.max,
-            "latency": round(status.latency),
-            "players": players,
+            "players_online": status.players_online,
+            "players_max": status.players_max,
+            "latency": getattr(status, "latency", 0)
         }
 
     except Exception:
@@ -47,132 +33,81 @@ async def get_server_status():
             "online": False
         }
 
-# ==========================
-# STATUS COMMAND
-# ==========================
 
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    status = await get_server_status()
+async def monitor_server():
+    server_online = False
 
-    if not status["online"]:
-        await update.message.reply_text(
-            "🔴 Server Offline"
-        )
-        return
-
-    player_text = (
-        ", ".join(status["players"])
-        if status["players"]
-        else "Unavailable"
-    )
-
-    msg = (
-        "🟢 Server Online\n\n"
-        f"👥 Players: {status['players_online']}/{status['players_max']}\n"
-        f"📶 Latency: {status['latency']} ms\n"
-        f"🎮 Online: {player_text}"
-    )
-
-    await update.message.reply_text(msg)
-
-# ==========================
-# !status SUPPORT
-# ==========================
-
-async def bang_status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await status_command(update, context)
-
-# ==========================
-# MONITOR LOOP
-# ==========================
-
-async def monitor_server(app):
-    previous_state = None
+    online_streak = 0
+    offline_streak = 0
 
     while True:
 
         status = await get_server_status()
-        current_state = status["online"]
 
-        if previous_state is None:
-            previous_state = current_state
+        if status["online"]:
 
-        elif current_state != previous_state:
+            online_streak += 1
+            offline_streak = 0
 
-            now = datetime.now().strftime("%H:%M:%S")
+        else:
 
-            if current_state:
+            offline_streak += 1
+            online_streak = 0
 
-                if status["players"]:
-                    starter = status["players"][0]
-                    player_info = (
-                        f"\n🎮 First detected player: {starter}"
-                    )
-                else:
-                    player_info = ""
+        # OFFLINE -> ONLINE
+        if (
+            not server_online
+            and online_streak >= ONLINE_THRESHOLD
+        ):
+            server_online = True
 
-                message = (
-                    "🟢 Server Online\n\n"
-                    "A new session has started.\n"
-                    f"⏰ Time: {now}\n"                
-                    f"📶 Latency: {status['latency']} ms"
-                   
-                )
-
-            else:
-
-                message = (
-                    "🔴 Server Offline"
-                )
-
-            await app.bot.send_message(
-                chat_id=CHAT_ID,
-                text=message
+            print(
+                f"🟢 VERIFIED ONLINE "
+                f"({status['players_online']}/"
+                f"{status['players_max']})"
             )
 
-            previous_state = current_state
+            # Telegram send_message here
 
-        await asyncio.sleep(CHECK_INTERVAL)
+        # ONLINE -> OFFLINE
+        elif (
+            server_online
+            and offline_streak >= OFFLINE_THRESHOLD
+        ):
+            server_online = False
 
-# ==========================
-# STARTUP
-# ==========================
+            print("🔴 VERIFIED OFFLINE")
 
-async def post_init(app):
-    asyncio.create_task(
-        monitor_server(app)
-    )
+            # Telegram send_message here
 
-def main():
-
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    app.add_handler(
-        CommandHandler("status", status_command)
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & filters.Regex(r"^!status$"),
-            bang_status
+        await asyncio.sleep(
+            CHECK_INTERVAL
         )
+
+
+async def status_command():
+    status = await get_server_status()
+
+    if not status["online"]:
+        print("🔴 Server Offline")
+        return
+
+    print(
+        f"🟢 Server Online\n"
+        f"Players: "
+        f"{status['players_online']}/"
+        f"{status['players_max']}"
     )
 
-    print("Bot is running...")
 
-    app.run_polling()
+async def main():
+    asyncio.create_task(
+        monitor_server()
+    )
+
+    while True:
+        await asyncio.sleep(3600)
+
 
 if __name__ == "__main__":
-    main()
-
+    asyncio.run(main())
