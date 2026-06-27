@@ -1,7 +1,9 @@
 import asyncio
-import aiohttp
+import socket
+import struct
+import time
+import random
 from datetime import datetime
-from mcstatus import BedrockServer
 
 from telegram import Update
 from telegram.ext import (
@@ -23,126 +25,93 @@ HOST = "halkehalke.aternos.me"
 PORT = 50742
 
 CHECK_INTERVAL = 30
-
-# Require N consecutive agreeing checks before alerting
 ONLINE_THRESHOLD = 3
 OFFLINE_THRESHOLD = 3
 
-SERVER = BedrockServer.lookup(f"{HOST}:{PORT}")
-
 # ==========================
-# 3 SOURCES
+# RAW RAKNET UDP PING
+# Implements the Bedrock "Unconnected Ping" packet directly.
+# This is exactly what the Minecraft client sends — no library needed.
 # ==========================
 
-async def query_direct() -> bool | None:
-    """Direct UDP ping — real-time but can flicker during Aternos startup."""
-    try:
-        await asyncio.wait_for(SERVER.async_status(), timeout=8)
-        return True
-    except Exception:
-        return False
+RAKNET_MAGIC = bytes([
+    0x00, 0xFF, 0xFF, 0x00,
+    0xFE, 0xFE, 0xFE, 0xFE,
+    0xFD, 0xFD, 0xFD, 0xFD,
+    0x12, 0x34, 0x56, 0x78
+])
+
+def build_unconnected_ping() -> bytes:
+    """Build a RakNet Unconnected Ping packet (0x01)."""
+    packet_id = b'\x01'
+    timestamp = struct.pack('>Q', int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF)
+    client_guid = struct.pack('>Q', random.getrandbits(64))
+    return packet_id + timestamp + RAKNET_MAGIC + client_guid
 
 
-async def query_mcsrvstat(session: aiohttp.ClientSession) -> bool | None:
-    url = f"https://api.mcsrvstat.us/bedrock/3/{HOST}:{PORT}"
-    headers = {"User-Agent": "TelegramMCBot/1.0"}
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), headers=headers) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            return bool(data.get("online", False))
-    except Exception:
+def parse_pong(data: bytes) -> dict | None:
+    """
+    Parse RakNet Unconnected Pong (0x1C).
+    Returns player info or None if invalid.
+    """
+    if len(data) < 35 or data[0] != 0x1C:
         return None
 
-
-async def query_mcstatus_io(session: aiohttp.ClientSession) -> bool | None:
-    url = f"https://api.mcstatus.io/v2/status/bedrock/{HOST}:{PORT}"
+    # Skip: packet_id(1) + timestamp(8) + server_guid(8) + magic(16) + str_len(2) = 35
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            return bool(data.get("online", False))
-    except Exception:
-        return None
-
-
-async def get_server_status() -> dict:
-    """
-    Poll all 3 sources concurrently.
-    Returns:
-      online=True   — majority (2+/3) say online
-      online=False  — majority (2+/3) say offline
-      online=None   — too much disagreement, skip this tick
-    """
-    async with aiohttp.ClientSession() as session:
-        direct, r1, r2 = await asyncio.gather(
-            query_direct(),
-            query_mcsrvstat(session),
-            query_mcstatus_io(session),
-        )
-
-    votes = [v for v in (direct, r1, r2) if v is not None]
-
-    if len(votes) < 2:
-        # Fewer than 2 sources responded — not enough data
-        return {"online": None, "players_online": 0, "players_max": 0}
-
-    online_votes = sum(1 for v in votes if v)
-    offline_votes = len(votes) - online_votes
-
-    if online_votes > offline_votes:
-        # Majority says online — get player count from APIs
-        async with aiohttp.ClientSession() as session:
-            r1_full, r2_full = await asyncio.gather(
-                _query_mcsrvstat_full(session),
-                _query_mcstatus_io_full(session),
-            )
-        results = [r for r in (r1_full, r2_full) if r]
-        best = max(results, key=lambda r: r.get("players_online", 0)) if results else {}
+        str_len = struct.unpack('>H', data[33:35])[0]
+        motd_raw = data[35:35 + str_len].decode('utf-8', errors='ignore')
+        parts = motd_raw.split(';')
+        # Format: MCPE;MOTD;protocol;version;players;max_players;...
+        players_online = int(parts[4]) if len(parts) > 4 else 0
+        players_max = int(parts[5]) if len(parts) > 5 else 0
         return {
             "online": True,
-            "players_online": best.get("players_online", 0),
-            "players_max": best.get("players_max", 0),
+            "players_online": players_online,
+            "players_max": players_max,
         }
-    elif offline_votes > online_votes:
-        return {"online": False, "players_online": 0, "players_max": 0}
-    else:
-        # Exact tie (1 vs 1) — skip tick, don't change state
-        return {"online": None, "players_online": 0, "players_max": 0}
-
-
-async def _query_mcsrvstat_full(session: aiohttp.ClientSession) -> dict | None:
-    url = f"https://api.mcsrvstat.us/bedrock/3/{HOST}:{PORT}"
-    headers = {"User-Agent": "TelegramMCBot/1.0"}
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), headers=headers) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            return {
-                "players_online": data.get("players", {}).get("online", 0),
-                "players_max": data.get("players", {}).get("max", 0),
-            }
     except Exception:
-        return None
+        return {"online": True, "players_online": 0, "players_max": 0}
 
 
-async def _query_mcstatus_io_full(session: aiohttp.ClientSession) -> dict | None:
-    url = f"https://api.mcstatus.io/v2/status/bedrock/{HOST}:{PORT}"
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            players = data.get("players") or {}
-            return {
-                "players_online": players.get("online", 0),
-                "players_max": players.get("max", 0),
-            }
-    except Exception:
-        return None
+async def raknet_ping(host: str, port: int, timeout: float = 5.0) -> dict:
+    """
+    Send 3 UDP pings and return on first valid pong.
+    Retries handle UDP packet loss — common on Aternos.
+    """
+    loop = asyncio.get_event_loop()
+
+    def _ping_sync():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout / 3)
+        try:
+            ip = socket.gethostbyname(host)
+            ping_packet = build_unconnected_ping()
+            for _ in range(3):  # 3 attempts
+                try:
+                    sock.sendto(ping_packet, (ip, port))
+                    data, _ = sock.recvfrom(1024)
+                    result = parse_pong(data)
+                    if result:
+                        return result
+                except socket.timeout:
+                    continue
+            return {"online": False, "players_online": 0, "players_max": 0}
+        except Exception:
+            return {"online": False, "players_online": 0, "players_max": 0}
+        finally:
+            sock.close()
+
+    return await loop.run_in_executor(None, _ping_sync)
+
+
+# ==========================
+# STATUS — pure UDP, no APIs
+# ==========================
+
+async def get_server_status() -> dict:
+    return await raknet_ping(HOST, PORT)
+
 
 # ==========================
 # COMMANDS
@@ -150,10 +119,6 @@ async def _query_mcstatus_io_full(session: aiohttp.ClientSession) -> dict | None
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await get_server_status()
-
-    if status["online"] is None:
-        await update.message.reply_text("⚠️ Sources are split, try again in a moment.")
-        return
 
     if not status["online"]:
         await update.message.reply_text("🔴 Server Offline")
@@ -168,6 +133,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bang_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_command(update, context)
 
+
 # ==========================
 # MONITOR
 # ==========================
@@ -181,12 +147,6 @@ async def monitor_server(app):
         try:
             status = await get_server_status()
 
-            if status["online"] is None:
-                # Sources disagree — freeze streaks, don't change state
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Sources split, skipping tick.")
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
-
             if status["online"]:
                 online_streak += 1
                 offline_streak = 0
@@ -197,13 +157,13 @@ async def monitor_server(app):
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
                 f"online={status['online']} | "
-                f"streak +{online_streak}✅ -{offline_streak}❌"
+                f"+{online_streak}✅ -{offline_streak}❌"
             )
 
             # OFFLINE -> ONLINE
             if not server_online and online_streak >= ONLINE_THRESHOLD:
                 server_online = True
-                online_streak = 0  # reset so it doesn't re-trigger
+                online_streak = 0
                 now = datetime.now().strftime("%H:%M:%S")
                 await app.bot.send_message(
                     chat_id=CHAT_ID,
@@ -217,7 +177,7 @@ async def monitor_server(app):
             # ONLINE -> OFFLINE
             elif server_online and offline_streak >= OFFLINE_THRESHOLD:
                 server_online = False
-                offline_streak = 0  # reset so it doesn't re-trigger
+                offline_streak = 0
                 await app.bot.send_message(
                     chat_id=CHAT_ID,
                     text="🔴 Server Offline"
@@ -228,37 +188,12 @@ async def monitor_server(app):
 
         await asyncio.sleep(CHECK_INTERVAL)
 
+
 # ==========================
 # STARTUP
 # ==========================
 
 async def post_init(app):
     try:
-        await app.bot.send_message(chat_id=CHAT_ID, text="🤖 Bot started! Monitoring server...")
-    except Exception as e:
-        print("Startup message failed:", e)
-    asyncio.create_task(monitor_server(app))
-
-
-def main():
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & filters.Regex(r"^\s*!status\s*$"),
-            bang_status,
-        )
-    )
-
-    print(f"Monitoring {HOST}:{PORT}")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+        await app.bot.send_message(chat_id=CHAT_ID
+                                   
