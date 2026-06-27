@@ -21,7 +21,7 @@ from telegram.ext import (
 BOT_TOKEN = "8921983178:AAGtkbi1tLNo9qA9CHpD4KdsxLZw6ut3hkY"
 CHAT_ID = -1004273685959
 
-HOST = "darkhaldwani.aternos.me"
+HOST = "halkehalke.aternos.me"
 PORT = 50742
 
 CHECK_INTERVAL = 30
@@ -30,8 +30,6 @@ OFFLINE_THRESHOLD = 3
 
 # ==========================
 # RAW RAKNET UDP PING
-# Implements the Bedrock "Unconnected Ping" packet directly.
-# This is exactly what the Minecraft client sends — no library needed.
 # ==========================
 
 RAKNET_MAGIC = bytes([
@@ -41,8 +39,15 @@ RAKNET_MAGIC = bytes([
     0x12, 0x34, 0x56, 0x78
 ])
 
+# Aternos proxy responds during sleep/queue with these MOTDs
+ATERNOS_FAKE_MOTDS = [
+    "queuing", "starting", "loading",
+    "stopping", "waiting", "offline",
+    "maintenance", "queue"
+]
+
+
 def build_unconnected_ping() -> bytes:
-    """Build a RakNet Unconnected Ping packet (0x01)."""
     packet_id = b'\x01'
     timestamp = struct.pack('>Q', int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF)
     client_guid = struct.pack('>Q', random.getrandbits(64))
@@ -50,35 +55,38 @@ def build_unconnected_ping() -> bytes:
 
 
 def parse_pong(data: bytes) -> dict | None:
-    """
-    Parse RakNet Unconnected Pong (0x1C).
-    Returns player info or None if invalid.
-    """
     if len(data) < 35 or data[0] != 0x1C:
         return None
 
-    # Skip: packet_id(1) + timestamp(8) + server_guid(8) + magic(16) + str_len(2) = 35
     try:
         str_len = struct.unpack('>H', data[33:35])[0]
         motd_raw = data[35:35 + str_len].decode('utf-8', errors='ignore')
         parts = motd_raw.split(';')
-        # Format: MCPE;MOTD;protocol;version;players;max_players;...
+
+        # Always print so we can see what Aternos is actually sending
+        print(f"Raw MOTD: {motd_raw}")
+
+        motd_text = parts[1].lower() if len(parts) > 1 else ""
+
+        # Aternos proxy answers even when server is sleeping — filter it out
+        if any(fake in motd_text for fake in ATERNOS_FAKE_MOTDS):
+            print(f"Aternos proxy detected (MOTD: '{parts[1] if len(parts) > 1 else motd_raw}'), treating as offline")
+            return {"online": False, "players_online": 0, "players_max": 0}
+
         players_online = int(parts[4]) if len(parts) > 4 else 0
         players_max = int(parts[5]) if len(parts) > 5 else 0
+
         return {
             "online": True,
             "players_online": players_online,
             "players_max": players_max,
         }
-    except Exception:
+    except Exception as e:
+        print(f"parse_pong error: {e}")
         return {"online": True, "players_online": 0, "players_max": 0}
 
 
 async def raknet_ping(host: str, port: int, timeout: float = 5.0) -> dict:
-    """
-    Send 3 UDP pings and return on first valid pong.
-    Retries handle UDP packet loss — common on Aternos.
-    """
     loop = asyncio.get_event_loop()
 
     def _ping_sync():
@@ -87,7 +95,7 @@ async def raknet_ping(host: str, port: int, timeout: float = 5.0) -> dict:
         try:
             ip = socket.gethostbyname(host)
             ping_packet = build_unconnected_ping()
-            for _ in range(3):  # 3 attempts
+            for _ in range(3):
                 try:
                     sock.sendto(ping_packet, (ip, port))
                     data, _ = sock.recvfrom(1024)
@@ -97,7 +105,8 @@ async def raknet_ping(host: str, port: int, timeout: float = 5.0) -> dict:
                 except socket.timeout:
                     continue
             return {"online": False, "players_online": 0, "players_max": 0}
-        except Exception:
+        except Exception as e:
+            print(f"raknet_ping error: {e}")
             return {"online": False, "players_online": 0, "players_max": 0}
         finally:
             sock.close()
@@ -106,7 +115,7 @@ async def raknet_ping(host: str, port: int, timeout: float = 5.0) -> dict:
 
 
 # ==========================
-# STATUS — pure UDP, no APIs
+# STATUS
 # ==========================
 
 async def get_server_status() -> dict:
@@ -223,3 +232,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
