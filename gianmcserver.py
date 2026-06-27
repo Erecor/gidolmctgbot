@@ -195,5 +195,31 @@ async def monitor_server(app):
 
 async def post_init(app):
     try:
-        await app.bot.send_message(chat_id=CHAT_ID
-                                   
+        await app.bot.send_message(chat_id=CHAT_ID, text="🤖 Bot started!")
+    except Exception as e:
+        print("Startup message failed:", e)
+    asyncio.create_task(monitor_server(app))
+
+
+def main():
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"^\s*!status\s*$"),
+            bang_status,
+        )
+    )
+
+    print(f"Monitoring {HOST}:{PORT}")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
