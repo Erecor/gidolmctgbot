@@ -21,7 +21,7 @@ from telegram.ext import (
 BOT_TOKEN = "8921983178:AAGtkbi1tLNo9qA9CHpD4KdsxLZw6ut3hkY"
 CHAT_ID = -1004273685959
 
-HOST = "halkehalke.aternos.me"
+HOST = "darkhaldwani.aternos.me"
 PORT = 50742
 
 CHECK_INTERVAL = 30
